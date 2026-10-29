@@ -1031,6 +1031,22 @@ impl OptionSpec {
     }
 }
 
+/// Whether an idiomatic version file is a structured source file rather than a plain
+/// version file, so a backend that would read it verbatim must have a real parser.
+///
+/// A `Gemfile` is listed as a `ruby` idiomatic file because `core:ruby` parses it
+/// natively (see `plugins::core::ruby_common::parse_gemfile`). A backend without a
+/// parser -- an asdf plugin with no `parse-legacy-file`, or the generic whitespace
+/// fallback -- would otherwise split `source 'https://rubygems.org'` into tokens that
+/// are not versions and abort config loading, so it skips the file instead. This is
+/// kept in code, next to the native parser, rather than as a registry field so the
+/// registry stays readable by released clients that float it.
+pub(crate) fn idiomatic_file_requires_parser(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "Gemfile")
+}
+
 /// Normalize idiomatic file contents by removing comments and empty lines.
 /// Full-line and inline comments are supported by .python-version, .nvmrc, etc.
 pub(crate) fn normalize_idiomatic_contents(contents: &str) -> String {
@@ -1488,6 +1504,17 @@ mod tests {
 
     fn create_test_tool_request(ba: Arc<BackendArg>, version: &str) -> ToolRequest {
         ToolRequest::new(ba, version, ToolSource::Argument).unwrap()
+    }
+
+    #[test]
+    fn idiomatic_file_requires_parser_matches_structured_files() {
+        assert!(idiomatic_file_requires_parser(Path::new("Gemfile")));
+        assert!(idiomatic_file_requires_parser(Path::new("/repo/Gemfile")));
+        assert!(!idiomatic_file_requires_parser(Path::new(".ruby-version")));
+        assert!(!idiomatic_file_requires_parser(Path::new(
+            "/repo/.ruby-version"
+        )));
+        assert!(!idiomatic_file_requires_parser(Path::new("Gemfile.lock")));
     }
 
     #[test]
@@ -5005,6 +5032,11 @@ pub trait Backend: Debug + Send + Sync {
     /// Default implementation reads the file and treats each whitespace-separated token as a version.
     /// Override to provide format-specific parsing; return `Err` on real failures so the plugin is skipped.
     async fn _parse_idiomatic_file(&self, path: &Path) -> eyre::Result<Vec<String>> {
+        // The verbatim whitespace split only makes sense for a plain version file; a structured
+        // file like a `Gemfile` would split into non-version tokens that abort config loading.
+        if idiomatic_file_requires_parser(path) {
+            return Ok(vec![]);
+        }
         let contents = file::read_to_string(path)?;
         let normalized = normalize_idiomatic_contents(&contents);
         if normalized.is_empty() {

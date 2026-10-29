@@ -10,7 +10,7 @@ use crate::args::BackendArg;
 use crate::backend::VersionInfo;
 use crate::backend::backend_type::BackendType;
 use crate::backend::external_plugin_cache::ExternalPluginCache;
-use crate::backend::normalize_idiomatic_contents;
+use crate::backend::{idiomatic_file_requires_parser, normalize_idiomatic_contents};
 use crate::cache::{CacheManager, CacheManagerBuilder};
 use crate::config::env_directive::EnvResults;
 use crate::config::{Config, Settings, SettingsExt};
@@ -416,15 +416,32 @@ impl Backend for AsdfBackend {
     }
 
     async fn _parse_idiomatic_file(&self, idiomatic_file: &Path) -> Result<Vec<String>> {
-        if let Some(cached) = self.fetch_cached_idiomatic_file(idiomatic_file)? {
+        let script = ParseIdiomaticFile(idiomatic_file.to_string_lossy().into());
+        let has_parser = self.plugin.script_man.script_exists(&script);
+        let requires_parser = idiomatic_file_requires_parser(idiomatic_file);
+        // Without the plugin's own parser mise reads the file verbatim, which
+        // only yields a version for a plain file like `.ruby-version`. A
+        // structured file (a `Gemfile`) read verbatim would split into
+        // non-version tokens that abort config loading; resolve nothing instead.
+        if requires_parser && !has_parser {
+            return Ok(vec![]);
+        }
+        // The idiomatic cache stores the file read verbatim or the parser's
+        // output without recording which. For a structured file that is unsafe:
+        // an older mise (or a run before the plugin gained a parser) cached it
+        // verbatim, and returning that once a parser exists would resurface its
+        // invalid tokens. Always parse such a file fresh through the parser
+        // rather than trusting the cache.
+        if !requires_parser
+            && let Some(cached) = self.fetch_cached_idiomatic_file(idiomatic_file)?
+        {
             return Ok(cached.split_whitespace().map(|s| s.to_string()).collect());
         }
         trace!(
             "parsing idiomatic file: {}",
             idiomatic_file.to_string_lossy()
         );
-        let script = ParseIdiomaticFile(idiomatic_file.to_string_lossy().into());
-        let idiomatic_version = match self.plugin.script_man.script_exists(&script) {
+        let idiomatic_version = match has_parser {
             true => self.plugin.script_man.read(&script)?,
             false => fs::read_to_string(idiomatic_file)?,
         }
